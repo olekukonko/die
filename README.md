@@ -171,13 +171,3 @@ go build -ldflags="-X github.com/olekukonko/die.Version=v1.0.0 -X github.com/ole
 ## License
 
 MIT License – see [LICENSE](LICENSE) for details.
-```
-
-The README is organized for quick scanning with:
-- **Tables** for flags instead of dense paragraphs
-- **Examples** section covering common workflows (including the `--dry` flag placement you discovered)
-- **Output examples** to show what users will see
-- **Audit log format** for users who need forensics
-- **Installation and build** instructions
-
-Let me know if you'd like to add a section on CI integration, shell aliases, or platform-specific notes!
