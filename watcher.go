@@ -32,7 +32,7 @@ func (w *Watcher) Run(ctx context.Context, target string, mode TargetMode) {
 	ticker := time.NewTicker(w.interval)
 	defer ticker.Stop()
 
-	// Run immediately
+	// Run immediately on start
 	w.execute(ctx, target, mode)
 
 	for {

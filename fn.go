@@ -3,6 +3,7 @@ package die
 import "github.com/shirou/gopsutil/v3/process"
 
 // Helper functions
+
 func isProcessRunning(pid int32) bool {
 	p, err := process.NewProcess(pid)
 	if err != nil {
@@ -12,6 +13,8 @@ func isProcessRunning(pid int32) bool {
 	return running
 }
 
+// extractPIDs extracts the PID from each info at the top level only.
+// Use collectAllPIDs when a forest (tree mode) is involved.
 func extractPIDs(infos []*ProcessInfo) []int32 {
 	pids := make([]int32, len(infos))
 	for i, info := range infos {
@@ -25,4 +28,11 @@ func truncate(s string, max int) string {
 		return s
 	}
 	return s[:max-3] + "..."
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }

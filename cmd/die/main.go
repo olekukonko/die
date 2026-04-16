@@ -124,9 +124,8 @@ func main() {
 
 	ctx := context.Background()
 
-	// -----------------------------
 	// PREVIEW (always show table)
-	// -----------------------------
+
 	if !config.Quiet && mode != die.ModePID {
 		infos, err := killer.GetProcesses(ctx, target, mode)
 		if err == nil && len(infos) > 0 {
@@ -148,16 +147,14 @@ func main() {
 		}
 	}
 
-	// -----------------------------
 	// DRY RUN (exit early)
-	// -----------------------------
+
 	if config.DryRun {
 		return
 	}
 
-	// -----------------------------
 	// WATCH MODE
-	// -----------------------------
+
 	if *watchFlag > 0 {
 		watcher := die.NewWatcher(killer, die.WatcherConfig{
 			Interval: *watchFlag,
@@ -173,9 +170,8 @@ func main() {
 		return
 	}
 
-	// -----------------------------
 	// EXECUTE KILL
-	// -----------------------------
+
 	result, err := killer.Kill(ctx, target, mode)
 	if err != nil && !config.Quiet {
 		ui.PrintError("✗ Error: %v\n", err)

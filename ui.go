@@ -195,16 +195,36 @@ func (u *UI) renderTree(info *ProcessInfo, depth int, seen map[int32]bool) {
 	}
 }
 
-// RenderKillResult displays kill operation results
+// RenderKillResult displays kill operation results.
+//
+// When the run was a dry-run (preview), it prints a clear banner showing what
+// would have been killed and how to proceed. When live, it prints the outcome.
 func (u *UI) RenderKillResult(result *KillResult) {
 	if u.quiet {
 		return
 	}
 
+	if result.DryRun {
+		if result.Killed == 0 {
+			u.PrintWarning("\nNo matching processes found\n")
+			return
+		}
+		u.PrintWarning("\n[dry run] %d process(es) would be killed — no action taken\n", result.Killed)
+		u.PrintInfo("           Re-run with --kill to terminate them\n")
+		return
+	}
+
 	if result.Killed > 0 {
 		u.PrintSuccess("\n✓ Killed %d process(es) in %v\n", result.Killed, result.Duration)
-	} else if result.Failed > 0 {
-		u.PrintError("\n✗ Failed to kill %d process(es)\n", result.Failed)
+	}
+	if result.Failed > 0 {
+		u.PrintError("✗ Failed to kill %d process(es)\n", result.Failed)
+	}
+	if result.Skipped > 0 {
+		u.PrintWarning("⚠ Skipped %d process(es)\n", result.Skipped)
+	}
+	if result.Killed == 0 && result.Failed == 0 && result.Skipped == 0 {
+		u.PrintWarning("\nNo matching processes found\n")
 	}
 }
 
@@ -242,21 +262,42 @@ func (u *UI) RenderPortsJSON(ports []PortInfo) {
 	// to keep interface consistent
 }
 
-// ConfirmKill prompts for user confirmation
+// flattenInfos returns all ProcessInfo nodes from a forest (roots + children),
+// used so ConfirmKill can show accurate totals even in --tree mode.
+func flattenInfos(infos []*ProcessInfo) []*ProcessInfo {
+	var flat []*ProcessInfo
+	var walk func([]*ProcessInfo)
+	walk = func(nodes []*ProcessInfo) {
+		for _, n := range nodes {
+			flat = append(flat, n)
+			if len(n.Children) > 0 {
+				walk(n.Children)
+			}
+		}
+	}
+	walk(infos)
+	return flat
+}
+
+// ConfirmKill prompts for user confirmation before a destructive operation.
+// It accepts the infos slice as returned by Kill (may be a forest in --tree mode)
+// and flattens it internally so totals include all descendants.
 func (u *UI) ConfirmKill(infos []*ProcessInfo, force bool) bool {
 	if u.quiet {
 		return true
 	}
 
+	flat := flattenInfos(infos)
+
 	var totalCPU, totalMem float64
-	for _, info := range infos {
+	for _, info := range flat {
 		totalCPU += info.CPU
 		totalMem += float64(info.Mem)
 	}
 
-	u.PrintWarning("\n⚠ About to kill %d process(es)\n", len(infos))
+	u.PrintWarning("\n⚠ About to kill %d process(es)\n", len(flat))
 	fmt.Fprintf(u.out, "   Total CPU usage: %.1f%%\n", totalCPU)
-	fmt.Fprintf(u.out, "   Total memory: %.1f%%\n", totalMem)
+	fmt.Fprintf(u.out, "   Total memory:    %.1f%%\n", totalMem)
 
 	if force {
 		u.PrintError("   WARNING: Force kill enabled (no cleanup)\n")
@@ -276,27 +317,34 @@ func (u *UI) PrintUsage() {
 	help := fmt.Sprintf(`
 %s - Super Process Assassin v%s
 
-%s:
-  die 3000                    # Kill by port (auto-detected)
-  die node                    # Kill by name substring
-  die -p 8080                 # Explicit port mode
-  die -n nginx                # Explicit name mode
-  die -pid 1234               # Kill specific PID
-  die -cgroup /docker/abc     # Kill by cgroup (containers)
-  die --cpu-above 90          # Kill high CPU processes
-  die --mem-above 80 nginx    # Kill high memory matching 'nginx'
+%s (safe by default — always previews without %s):
+  die 3000                    # Preview what listens on port 3000
+  die node                    # Preview matching processes by name
+  die -p 8080                 # Explicit port mode (preview)
+  die -n nginx                # Explicit name mode (preview)
+  die -pid 1234               # Preview specific PID
+  die -cgroup /docker/abc     # Preview by cgroup (containers)
+  die --cpu-above 90          # Preview high CPU processes
+  die --mem-above 80          # Preview high memory processes
+
+%s (add %s to actually kill):
+  die node --kill             # Kill by name substring
+  die 3000 --kill             # Kill by port
+  die -f --tree 3000 --kill   # Force kill entire process tree on port
+  die -a -r "chrome.*" --kill # Regex kill all chrome instances
 
 %s:
-  -f, --force                 # SIGKILL immediately (no graceful)
+  --kill                      # Perform actual kill (required; default is preview)
+  -f, --force                 # SIGKILL immediately (no graceful shutdown)
   -t, --timeout 5s            # Grace period before SIGKILL
   -a, --all                   # Kill all matches (default: first only)
   --tree                      # Kill entire process tree
   -r, --regex                 # Use regex for name matching
 
 %s:
-  --dry                       # Preview only (no actual kill)
+  --dry                       # Explicit preview (same as omitting --kill)
   -i, --interactive           # Confirm before killing
-  -q, --quiet                 # Suppress warnings
+  -q, --quiet                 # Suppress output
   -v, --verbose               # Detailed output
   --audit /var/log/die.log    # JSON audit trail
 
@@ -307,24 +355,25 @@ func (u *UI) PrintUsage() {
   -j 8                        # Parallelism (default: CPU count)
 
 %s:
-  %s              # Force kill tree on port
-  %s             # Regex kill all chrome
-  %s  # Watch & kill hungry node
-  %s             # Preview what would die
-  %s # Kill by cgroup
+  %s         # Preview what would be killed
+  %s  # Actually kill it
+  %s      # Preview entire process tree
+  %s   # Watch & kill hungry node (live)
 `,
 		u.theme.Primary.Sprint("die"),
 		Version,
 		u.theme.Warning.Sprint("TARGETING MODES"),
+		u.theme.Error.Sprint("--kill"),
+		u.theme.Warning.Sprint("LIVE KILL"),
+		u.theme.Error.Sprint("--kill"),
 		u.theme.Warning.Sprint("KILL OPTIONS"),
 		u.theme.Warning.Sprint("SAFETY & CONTROL"),
 		u.theme.Warning.Sprint("DISCOVERY"),
 		u.theme.Warning.Sprint("EXAMPLES"),
-		u.theme.Success.Sprint("die -f --tree 3000"),
-		u.theme.Success.Sprint("die -a -r \"chrome.*\""),
-		u.theme.Success.Sprint("die -w 5s --mem-above 50 node"),
-		u.theme.Success.Sprint("die --dry -a python"),
-		u.theme.Success.Sprint("die -cgroup /system.slice/apache2"),
+		u.theme.Success.Sprint("die node"),
+		u.theme.Error.Sprint("die node --kill"),
+		u.theme.Success.Sprint("die --tree 3000"),
+		u.theme.Error.Sprint("die -w 5s --mem-above 50 node --kill"),
 	)
 
 	fmt.Fprint(u.out, help)

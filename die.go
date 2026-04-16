@@ -30,6 +30,9 @@ type Killer struct {
 
 // NewKiller creates a new Killer instance
 func NewKiller(config Config, logger *ll.Logger) (*Killer, error) {
+	// Apply safe defaults for zero values
+	config = config.WithDefaults()
+
 	k := &Killer{
 		config: config,
 		logger: logger,
@@ -84,21 +87,31 @@ func (k *Killer) Kill(ctx context.Context, target string, mode TargetMode) (*Kil
 		return result, nil
 	}
 
-	// Enrich process info
+	// Enrich process info — self is filtered out here
 	infos := k.enrichProcesses(ctx, pids)
 	if len(infos) == 0 {
 		result.Duration = time.Since(start)
 		return result, nil
 	}
 
+	// Apply --all flag: if not set, only target the first match
+	if !k.config.All && len(infos) > 1 {
+		infos = infos[:1]
+	}
+
 	if k.config.Tree {
 		infos = k.buildForest(infos)
 	}
 
-	// Store PIDs in result
-	result.PIDs = extractPIDs(infos)
+	// Store PIDs in result (includes tree children)
+	result.PIDs = collectAllPIDs(infos)
 
-	if k.config.DryRun {
+	// Dry-run: preview only — never touch a process.
+	// Triggered by default (KillEnabled=false), --dry flag, or zero-value Config.
+	if k.config.IsDryRun() {
+		result.DryRun = true
+		result.Killed = len(result.PIDs) // report what *would* be killed
+		result.Duration = time.Since(start)
 		k.logAudit(AuditEntry{
 			Timestamp: time.Now(),
 			Action:    "dry_run",
@@ -110,9 +123,17 @@ func (k *Killer) Kill(ctx context.Context, target string, mode TargetMode) (*Kil
 			Force:     k.config.Force,
 			Tree:      k.config.Tree,
 		})
-		result.Killed = len(infos)
-		result.Duration = time.Since(start)
 		return result, nil
+	}
+
+	// Prompt for confirmation when interactive flag is set,
+	// or automatically when the blast radius is large.
+	if !k.config.Quiet && (k.config.Interactive || len(infos) > AutoConfirmLimit) {
+		ui := NewUI(WithVerbose(k.config.Verbose))
+		if !ui.ConfirmKill(infos, k.config.Force) {
+			result.Duration = time.Since(start)
+			return result, nil
+		}
 	}
 
 	// Execute kills
@@ -243,12 +264,20 @@ func (k *Killer) discover(ctx context.Context, target string, mode TargetMode) (
 			return []int32{int32(pid)}, nil
 		}
 		return nil, nil
+	case ModeCgroup:
+		return k.findByCgroup(ctx, target)
 	case ModeCPUAbove:
-		threshold, _ := strconv.ParseFloat(target, 64)
-		return k.findByResource(ctx, target, threshold)
+		threshold, err := strconv.ParseFloat(target, 64)
+		if err != nil {
+			return nil, fmt.Errorf("invalid CPU threshold: %w", err)
+		}
+		return k.findByResourceMetric(ctx, threshold, true)
 	case ModeMemAbove:
-		threshold, _ := strconv.ParseFloat(target, 64)
-		return k.findByResource(ctx, target, threshold)
+		threshold, err := strconv.ParseFloat(target, 64)
+		if err != nil {
+			return nil, fmt.Errorf("invalid memory threshold: %w", err)
+		}
+		return k.findByResourceMetric(ctx, threshold, false)
 	default:
 		return k.findByName(ctx, target, mode)
 	}
@@ -304,6 +333,7 @@ func (k *Killer) findByName(ctx context.Context, pattern string, mode TargetMode
 		}
 	}
 
+	selfPID := int32(os.Getpid())
 	var pids []int32
 	var mu sync.Mutex
 	var wg sync.WaitGroup
@@ -316,6 +346,11 @@ func (k *Killer) findByName(ctx context.Context, pattern string, mode TargetMode
 
 			semaphore <- struct{}{}
 			defer func() { <-semaphore }()
+
+			// Never return ourselves
+			if proc.Pid == selfPID {
+				return
+			}
 
 			name, err := proc.NameWithContext(ctx)
 			if err != nil {
@@ -349,13 +384,18 @@ func (k *Killer) findByName(ctx context.Context, pattern string, mode TargetMode
 	return pids, nil
 }
 
-// findByResource discovers processes by resource usage
-func (k *Killer) findByResource(ctx context.Context, target string, threshold float64) ([]int32, error) {
+// findByCgroup discovers processes belonging to a specific cgroup
+func (k *Killer) findByCgroup(ctx context.Context, cgroupPattern string) ([]int32, error) {
+	if runtime.GOOS != "linux" {
+		return nil, fmt.Errorf("cgroup targeting is only supported on Linux")
+	}
+
 	procs, err := process.ProcessesWithContext(ctx)
 	if err != nil {
 		return nil, err
 	}
 
+	selfPID := int32(os.Getpid())
 	var pids []int32
 	var mu sync.Mutex
 	var wg sync.WaitGroup
@@ -369,17 +409,12 @@ func (k *Killer) findByResource(ctx context.Context, target string, threshold fl
 			semaphore <- struct{}{}
 			defer func() { <-semaphore }()
 
-			if k.config.Regex && target != "" {
-				name, _ := proc.NameWithContext(ctx)
-				if !strings.Contains(strings.ToLower(name), strings.ToLower(target)) {
-					return
-				}
+			if proc.Pid == selfPID {
+				return
 			}
 
-			cpuPercent, _ := proc.CPUPercentWithContext(ctx)
-			memPercent, _ := proc.MemoryPercentWithContext(ctx)
-
-			if threshold > 0 && threshold < 100 && (cpuPercent > threshold || float64(memPercent) > threshold) {
+			cg := k.getCgroup(proc.Pid)
+			if strings.Contains(cg, cgroupPattern) {
 				mu.Lock()
 				pids = append(pids, proc.Pid)
 				mu.Unlock()
@@ -391,13 +426,81 @@ func (k *Killer) findByResource(ctx context.Context, target string, threshold fl
 	return pids, nil
 }
 
-// enrichProcesses gathers detailed info for PIDs concurrently
+// findByResourceMetric discovers processes exceeding a resource threshold.
+// When cpuMode is true it checks CPU%, otherwise it checks memory%.
+func (k *Killer) findByResourceMetric(ctx context.Context, threshold float64, cpuMode bool) ([]int32, error) {
+	if threshold <= 0 || threshold >= 100 {
+		return nil, fmt.Errorf("threshold must be between 0 and 100, got %.1f", threshold)
+	}
+
+	procs, err := process.ProcessesWithContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	selfPID := int32(os.Getpid())
+	var pids []int32
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	semaphore := make(chan struct{}, k.config.Parallelism)
+
+	for _, p := range procs {
+		wg.Add(1)
+		go func(proc *process.Process) {
+			defer wg.Done()
+
+			semaphore <- struct{}{}
+			defer func() { <-semaphore }()
+
+			if proc.Pid == selfPID {
+				return
+			}
+
+			var exceeded bool
+			if cpuMode {
+				cpuPercent, err := proc.CPUPercentWithContext(ctx)
+				if err == nil {
+					exceeded = cpuPercent > threshold
+				}
+			} else {
+				memPercent, err := proc.MemoryPercentWithContext(ctx)
+				if err == nil {
+					exceeded = float64(memPercent) > threshold
+				}
+			}
+
+			if exceeded {
+				mu.Lock()
+				pids = append(pids, proc.Pid)
+				mu.Unlock()
+			}
+		}(p)
+	}
+
+	wg.Wait()
+	return pids, nil
+}
+
+// enrichProcesses gathers detailed info for PIDs concurrently, filtering self
 func (k *Killer) enrichProcesses(ctx context.Context, pids []int32) []*ProcessInfo {
+	selfPID := int32(os.Getpid())
+
 	var wg sync.WaitGroup
 	semaphore := make(chan struct{}, k.config.Parallelism)
 	results := make(chan *ProcessInfo, len(pids))
 
 	for _, pid := range pids {
+		// Skip self — never include the running die process
+		if pid == selfPID {
+			k.mu.Lock()
+			k.stats.Skipped++
+			k.mu.Unlock()
+			if k.logger != nil {
+				k.logger.Fields("pid", pid).Debug("skipping self")
+			}
+			continue
+		}
+
 		wg.Add(1)
 		go func(p int32) {
 			defer wg.Done()
@@ -514,6 +617,22 @@ func (k *Killer) buildForest(infos []*ProcessInfo) []*ProcessInfo {
 	return roots
 }
 
+// collectAllPIDs extracts every PID from a forest (roots + all descendants)
+func collectAllPIDs(infos []*ProcessInfo) []int32 {
+	var pids []int32
+	var walk func([]*ProcessInfo)
+	walk = func(nodes []*ProcessInfo) {
+		for _, n := range nodes {
+			pids = append(pids, n.PID)
+			if len(n.Children) > 0 {
+				walk(n.Children)
+			}
+		}
+	}
+	walk(infos)
+	return pids
+}
+
 // executeKills performs the actual termination
 func (k *Killer) executeKills(infos []*ProcessInfo) {
 	if k.config.Tree {
@@ -558,6 +677,7 @@ func (k *Killer) killSingle(info *ProcessInfo) bool {
 	k.stats.Attempted++
 	k.mu.Unlock()
 
+	// Self-kill guard (defence-in-depth; enrichProcesses already filters self)
 	if info.PID == int32(os.Getpid()) {
 		k.mu.Lock()
 		k.stats.Skipped++

@@ -165,7 +165,7 @@ go build -o die ./cmd/die
 
 Set version info:
 ```bash
-go build -ldflags="-X github.com/olekukonko/die.Version=v1.0.0 -X github.com/olekukonko/die.BuildTime=$(date -u +%Y-%m-%dT%H:%M:%SZ)" -o die ./cmd/die
+go build -ldflags="-X github.com/olekukonko/die.Version=v0.1.0 -X github.com/olekukonko/die.BuildTime=$(date -u +%Y-%m-%dT%H:%M:%SZ)" -o die ./cmd/die
 ```
 
 ## License
